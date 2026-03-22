@@ -84,7 +84,6 @@ var certCache = struct {
 //////////////////////////////
 
 func main() {
-
 	if len(os.Args) < 2 {
 		fmt.Println("usage: sni-proxy config.yml")
 		return
@@ -94,7 +93,6 @@ func main() {
 	initCA()
 
 	addr := fmt.Sprintf(":%d", cfg.SNIProxy.Port)
-
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		logFatal(err.Error())
@@ -132,9 +130,7 @@ func loadConfig(p string) {
 
 func handleConn(c net.Conn) {
 	defer c.Close()
-
 	br := bufio.NewReader(c)
-
 	req, err := http.ReadRequest(br)
 	if err != nil {
 		return
@@ -153,7 +149,6 @@ func handleConn(c net.Conn) {
 
 func matchHost(host string) *Mapping {
 	host = strings.Split(host, ":")[0]
-
 	for _, m := range cfg.HostMapping {
 		for _, p := range m.Pattern {
 			if wildcardMatch(p, host) {
@@ -177,21 +172,45 @@ func wildcardMatch(pattern, host string) bool {
 //////////////////////////////
 
 func handleHTTP(client net.Conn, req *http.Request) {
-
 	m := matchHost(req.Host)
 	if m == nil {
-		logErr("no mapping: " + req.Host)
+		logInfo("passthrough HTTP " + req.Host)
+		passthroughHTTP(client, req)
 		return
 	}
 
 	up, err := dialUpstream(m)
 	if err != nil {
-		logErr(err.Error())
+		logErr("upstream: " + err.Error())
 		return
 	}
 
 	req.Write(up)
+	go io.Copy(up, client)
 	io.Copy(client, up)
+}
+
+func passthroughHTTP(client net.Conn, req *http.Request) {
+	var host string
+	if req.URL.IsAbs() {
+		host = req.URL.Host
+	} else {
+		host = req.Host
+	}
+	u := host
+	if !strings.Contains(u, ":") {
+		u += ":80"
+	}
+
+	conn, err := dialViaProxy(u)
+	if err != nil {
+		logErr("passthrough connect fail: " + err.Error())
+		return
+	}
+
+	req.Write(conn)
+	go io.Copy(conn, client)
+	io.Copy(client, conn)
 }
 
 //////////////////////////////
@@ -199,20 +218,18 @@ func handleHTTP(client net.Conn, req *http.Request) {
 //////////////////////////////
 
 func handleHTTPS(client net.Conn, req *http.Request) {
-
 	host := req.Host
 	logConn("CONNECT " + host)
 
 	m := matchHost(host)
 	if m == nil {
-		logErr("no mapping")
+		logInfo("passthrough " + host)
+		passthroughCONNECT(client, host)
 		return
 	}
 
 	io.WriteString(client, "HTTP/1.1 200 Connection Established\r\n\r\n")
-
 	cert := getCert(host)
-
 	tlsClient := tls.Server(client, &tls.Config{
 		Certificates: []tls.Certificate{*cert},
 		NextProtos:   []string{"http/1.1"},
@@ -232,11 +249,25 @@ func handleHTTPS(client net.Conn, req *http.Request) {
 
 	up, err := dialUpstream(m)
 	if err != nil {
+		logErr("upstream: " + err.Error())
 		return
 	}
 
 	r.Write(up)
+	go io.Copy(up, tlsClient)
 	io.Copy(tlsClient, up)
+}
+
+func passthroughCONNECT(client net.Conn, host string) {
+	up, err := dialViaProxy(host)
+	if err != nil {
+		logErr(err.Error())
+		return
+	}
+
+	io.WriteString(client, "HTTP/1.1 200 Connection Established\r\n\r\n")
+	go io.Copy(up, client)
+	io.Copy(client, up)
 }
 
 //////////////////////////////
@@ -244,12 +275,10 @@ func handleHTTPS(client net.Conn, req *http.Request) {
 //////////////////////////////
 
 func dialUpstream(m *Mapping) (net.Conn, error) {
-
 	port := m.Port
 	if port == 0 {
 		port = 443
 	}
-
 	addr := fmt.Sprintf("%s:%d", m.SNI, port)
 
 	raw, err := dialViaProxy(addr)
@@ -271,20 +300,17 @@ func dialUpstream(m *Mapping) (net.Conn, error) {
 //////////////////////////////
 
 func dialViaProxy(target string) (net.Conn, error) {
-
 	if cfg.Upstream.Proxy == "" {
 		return net.Dial("tcp", target)
 	}
 
 	u, _ := url.Parse(cfg.Upstream.Proxy)
-
 	conn, err := net.Dial("tcp", u.Host)
 	if err != nil {
 		return nil, err
 	}
 
 	var buf bytes.Buffer
-
 	fmt.Fprintf(&buf, "CONNECT %s HTTP/1.1\r\n", target)
 	fmt.Fprintf(&buf, "Host: %s\r\n", target)
 
@@ -294,7 +320,6 @@ func dialViaProxy(target string) (net.Conn, error) {
 	}
 
 	buf.WriteString("\r\n")
-
 	conn.Write(buf.Bytes())
 
 	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
@@ -314,17 +339,11 @@ func dialViaProxy(target string) (net.Conn, error) {
 //////////////////////////////
 
 func buildAuth() string {
-
 	mode := strings.ToLower(cfg.Upstream.Auth.Mode)
-
 	switch mode {
 	case "basic":
-		return basicAuth(
-			cfg.Upstream.Auth.Username,
-			cfg.Upstream.Auth.Password,
-		)
+		return basicAuth(cfg.Upstream.Auth.Username, cfg.Upstream.Auth.Password)
 	}
-
 	return ""
 }
 
@@ -338,9 +357,13 @@ func basicAuth(u, p string) string {
 //////////////////////////////
 
 func initCA() {
+	if _, err := os.Stat("ca.crt"); err == nil {
+		loadCA()
+		logInfo("ca loaded")
+		return
+	}
 
 	var err error
-
 	caKey, err = rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		logFatal(err.Error())
@@ -351,23 +374,36 @@ func initCA() {
 		Subject: pkix.Name{
 			CommonName: "SNI Proxy CA",
 		},
-		NotBefore: time.Now(),
-		NotAfter:  time.Now().Add(10 * 365 * 24 * time.Hour),
-
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(10 * 365 * 24 * time.Hour),
 		IsCA:                  true,
 		KeyUsage:              x509.KeyUsageCertSign,
 		BasicConstraintsValid: true,
 	}
 
 	der, _ := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &caKey.PublicKey, caKey)
-
 	caCert, _ = x509.ParseCertificate(der)
 
-	f, _ := os.Create("ca.crt")
-	pem.Encode(f, &pem.Block{Type: "CERTIFICATE", Bytes: der})
-	f.Close()
+	savePEM("ca.crt", "CERTIFICATE", der)
+	savePEM("ca.key", "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(caKey))
 
-	logInfo("ca.crt generated")
+	logInfo("ca generated")
+}
+
+func loadCA() {
+	certPEM, _ := os.ReadFile("ca.crt")
+	keyPEM, _ := os.ReadFile("ca.key")
+	certBlock, _ := pem.Decode(certPEM)
+	keyBlock, _ := pem.Decode(keyPEM)
+
+	caCert, _ = x509.ParseCertificate(certBlock.Bytes)
+	caKey, _ = x509.ParsePKCS1PrivateKey(keyBlock.Bytes)
+}
+
+func savePEM(path, typ string, b []byte) {
+	f, _ := os.Create(path)
+	pem.Encode(f, &pem.Block{Type: typ, Bytes: b})
+	f.Close()
 }
 
 //////////////////////////////
@@ -375,7 +411,6 @@ func initCA() {
 //////////////////////////////
 
 func getCert(host string) *tls.Certificate {
-
 	certCache.Lock()
 	defer certCache.Unlock()
 
@@ -384,7 +419,6 @@ func getCert(host string) *tls.Certificate {
 	}
 
 	key, _ := rsa.GenerateKey(rand.Reader, 2048)
-
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(time.Now().UnixNano()),
 		Subject: pkix.Name{
@@ -393,18 +427,15 @@ func getCert(host string) *tls.Certificate {
 		DNSNames:  []string{host},
 		NotBefore: time.Now(),
 		NotAfter:  time.Now().Add(365 * 24 * time.Hour),
-
-		KeyUsage: x509.KeyUsageDigitalSignature,
+		KeyUsage:  x509.KeyUsageDigitalSignature,
 	}
 
 	der, _ := x509.CreateCertificate(rand.Reader, tmpl, caCert, &key.PublicKey, caKey)
-
 	cert := &tls.Certificate{
 		Certificate: [][]byte{der},
 		PrivateKey:  key,
 	}
 
 	certCache.m[host] = cert
-
 	return cert
 }
