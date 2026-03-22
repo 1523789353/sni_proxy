@@ -1,0 +1,29 @@
+sni_proxy:
+  port: 8080
+  disable_http2: true
+  chrome_tls: true
+
+# 前置代理
+upstream:
+  proxy: http://127.0.0.1:1080
+  insecure_skip_verify: true
+  auth:
+    mode: auto
+    # username: 你的账号
+    # password: 你的密码
+
+# 防止 DNS 污染
+hosts:
+  google.com: 142.250.72.14
+
+# 通过域名前置折射流量
+host_mapping:
+  - sni: google.com
+    port: 443
+    pattern:
+      - "*.youtube.com"
+      - "*.gstatic.com"
+
+  - sni: example.akamaized.net
+    pattern:
+      - "*.apple.com"
